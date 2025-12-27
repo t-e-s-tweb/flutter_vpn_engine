@@ -3,7 +3,11 @@ import 'package:flutter/services.dart';
 import 'models/config.dart';
 import 'models/connection_status.dart';
 import 'models/connection_stats.dart';
-import 'platform/vpn_engine_platform.dart';
+import 'models/tun_options.dart';
+import 'core/engine_manager.dart';
+import 'core/engine_config.dart';
+import 'platform/platform_interface_factory.dart';
+import 'platform/unified_platform_interface.dart';
 import 'subscription_manager.dart';
 import 'v2ray_url_parser.dart';
 
@@ -16,12 +20,15 @@ typedef StatusCallback = void Function(ConnectionStatus status);
 /// Callback для статистики
 typedef StatsCallback = void Function(ConnectionStats stats);
 
-/// Основной класс VPN Client Engine
-/// Предоставляет единый интерфейс для работы с различными VPN ядрами и драйверами
-class VpnClientEngine {
+/// Обновленный VPN Client Engine с поддержкой Unified Platform Interface
+/// 
+/// Автоматически определяет оптимальную конфигурацию:
+/// - SingBox: использует встроенный TUN (без драйверов)
+/// - LibXray/V2Ray: использует SOCKS драйверы
+class VpnClientEngineV2 {
   static const MethodChannel _channel = MethodChannel('vpnclient_engine');
 
-  static VpnClientEngine? _instance;
+  static VpnClientEngineV2? _instance;
 
   ConnectionStatus _status = ConnectionStatus.disconnected;
   ConnectionStats _stats = const ConnectionStats();
@@ -30,50 +37,85 @@ class VpnClientEngine {
   StatusCallback? _statusCallback;
   StatsCallback? _statsCallback;
 
-  VpnEngineConfig? _config;
+  EngineConfig? _engineConfig;
+  UnifiedPlatformInterface? _platformInterface;
+  PlatformTunHandle? _tunHandle;
 
   StreamController<ConnectionStatus>? _statusStreamController;
   StreamController<ConnectionStats>? _statsStreamController;
   StreamController<Map<String, String>>? _logStreamController;
 
-  // Platform layer
-  late final VpnEnginePlatform _platform;
-
   // Subscription manager
   late final SubscriptionManager _subscriptionManager;
 
-  VpnClientEngine._() {
-    _platform = VpnEnginePlatform();
+  VpnClientEngineV2._() {
     _subscriptionManager = SubscriptionManager();
     _setupMethodCallHandler();
   }
 
   /// Получить экземпляр движка (синглтон)
-  static VpnClientEngine get instance {
-    _instance ??= VpnClientEngine._();
+  static VpnClientEngineV2 get instance {
+    _instance ??= VpnClientEngineV2._();
     return _instance!;
   }
 
-  /// Инициализация с конфигурацией
-  Future<bool> initialize(VpnEngineConfig config) async {
-    _config = config;
+  /// Инициализация с конфигурацией (упрощенная версия)
+  /// 
+  /// Автоматически определяет оптимальную конфигурацию:
+  /// - Если указан CoreType.singbox, драйвер не требуется
+  /// - Если указан CoreType.libxray или CoreType.v2ray, используется драйвер
+  Future<bool> initialize({
+    required CoreType coreType,
+    required String configJson,
+    TunOptions? tunOptions,
+    DriverType? explicitDriver, // Явное указание драйвера (опционально)
+  }) async {
     try {
-      final result = _platform.initialize(config);
-      if (result) {
-        _log('INFO', 'VPN Engine initialized successfully');
-        _log('INFO', 'Core: ${config.core.type.name}');
-        _log('INFO', 'Driver: ${config.driver.type.name}');
+      // Создаем оптимальную конфигурацию
+      _engineConfig = EngineConfig(
+        coreType: coreType,
+        configJson: configJson,
+        tunOptions: tunOptions,
+        useNativeTun: !EngineManager.requiresDriver(coreType),
+        driverType: explicitDriver ?? (EngineManager.requiresDriver(coreType) 
+            ? DriverType.hevSocks5 
+            : null),
+      );
+
+      // Создаем Platform Interface для текущей платформы
+      _platformInterface = PlatformInterfaceFactory.create();
+
+      _log('INFO', 'VPN Engine initialized successfully');
+      _log('INFO', 'Core: ${coreType.name}');
+      _log('INFO', 'Using native TUN: ${_engineConfig!.useNativeTun}');
+      if (_engineConfig!.driverType != null) {
+        _log('INFO', 'Driver: ${_engineConfig!.driverType!.name}');
+      } else {
+        _log('INFO', 'Driver: None (native TUN)');
       }
-      return result;
+
+      return true;
     } catch (e) {
       _log('ERROR', 'Failed to initialize: $e');
       return false;
     }
   }
 
+  /// Инициализация с VpnEngineConfig (для обратной совместимости)
+  Future<bool> initializeWithConfig(VpnEngineConfig config) async {
+    final tunOptions = TunOptions.fromDriverConfig(config.driver);
+    
+    return initialize(
+      coreType: config.core.type,
+      configJson: config.core.configJson,
+      tunOptions: tunOptions,
+      explicitDriver: config.driver.type != DriverType.none ? config.driver.type : null,
+    );
+  }
+
   /// Подключиться к VPN
   Future<bool> connect() async {
-    if (_config == null) {
+    if (_engineConfig == null || _platformInterface == null) {
       _log('ERROR', 'Engine not initialized. Call initialize() first.');
       return false;
     }
@@ -82,7 +124,28 @@ class VpnClientEngine {
       _updateStatus(ConnectionStatus.connecting);
       _log('INFO', 'Connecting to VPN...');
 
-      final result = await _platform.connect();
+      // Проверяем привилегии
+      final hasPrivileges = await _platformInterface!.checkPrivileges();
+      if (!hasPrivileges) {
+        _log('ERROR', 'Missing required privileges for VPN connection');
+        _updateStatus(ConnectionStatus.error);
+        return false;
+      }
+
+      // Открываем TUN интерфейс если нужен
+      if (_engineConfig!.tunOptions != null) {
+        _tunHandle = await _platformInterface!.openTun(_engineConfig!.tunOptions!);
+        _log('INFO', 'TUN interface opened: FD=${_tunHandle!.fileDescriptor}');
+      }
+
+      // Настраиваем маршруты если нужно
+      if (_engineConfig!.tunOptions?.autoRoute == true) {
+        await _platformInterface!.setupRoutes(_engineConfig!.tunOptions!);
+        _log('INFO', 'Routes configured');
+      }
+
+      // Запускаем движок через нативный код
+      final result = await _startNativeEngine();
 
       if (result) {
         _updateStatus(ConnectionStatus.connected);
@@ -100,13 +163,28 @@ class VpnClientEngine {
     }
   }
 
+  /// Запуск нативного движка
+  Future<bool> _startNativeEngine() async {
+    // TODO: Реализовать вызов нативного кода через MethodChannel или FFI
+    // Пока возвращаем заглушку
+    return true;
+  }
+
   /// Отключиться от VPN
   Future<void> disconnect() async {
     try {
       _updateStatus(ConnectionStatus.disconnecting);
       _log('INFO', 'Disconnecting from VPN...');
 
-      _platform.disconnect();
+      // Закрываем TUN интерфейс
+      if (_tunHandle != null && _platformInterface != null) {
+        await _platformInterface!.closeTun(_tunHandle!);
+        _tunHandle = null;
+        _log('INFO', 'TUN interface closed');
+      }
+
+      // Останавливаем нативный движок
+      await _stopNativeEngine();
 
       _updateStatus(ConnectionStatus.disconnected);
       _log('INFO', 'Disconnected from VPN');
@@ -115,6 +193,11 @@ class VpnClientEngine {
       _log('ERROR', 'Failed to disconnect: $e');
       _updateStatus(ConnectionStatus.disconnected);
     }
+  }
+
+  /// Остановка нативного движка
+  Future<void> _stopNativeEngine() async {
+    // TODO: Реализовать остановку нативного движка
   }
 
   Timer? _statsTimer;
@@ -170,51 +253,10 @@ class VpnClientEngine {
     _statsCallback = callback;
   }
 
-  /// Получить имя ядра
-  Future<String> getCoreName() async {
-    try {
-      final result = await _channel.invokeMethod<String>('getCoreName');
-      return result ?? 'Unknown';
-    } catch (e) {
-      return 'Unknown';
-    }
-  }
-
-  /// Получить версию ядра
-  Future<String> getCoreVersion() async {
-    try {
-      final result = await _channel.invokeMethod<String>('getCoreVersion');
-      return result ?? 'Unknown';
-    } catch (e) {
-      return 'Unknown';
-    }
-  }
-
-  /// Получить имя драйвера
-  Future<String> getDriverName() async {
-    try {
-      final result = await _channel.invokeMethod<String>('getDriverName');
-      return result ?? 'None';
-    } catch (e) {
-      return 'None';
-    }
-  }
-
-  /// Протестировать соединение
-  Future<bool> testConnection() async {
-    try {
-      final result = await _channel.invokeMethod<bool>('testConnection');
-      return result ?? false;
-    } catch (e) {
-      _log('ERROR', 'Failed to test connection: $e');
-      return false;
-    }
-  }
-
   /// Обновить статистику
   Future<void> updateStats() async {
     try {
-      _stats = _platform.getStats();
+      // TODO: Получать статистику из нативного кода
       _statsCallback?.call(_stats);
       _statsStreamController?.add(_stats);
     } catch (e) {
@@ -296,25 +338,15 @@ class VpnClientEngine {
       return false;
     }
 
-    // Update config with server configuration
-    if (_config != null) {
-      final updatedCore = CoreConfig(
-        type: _config!.core.type,
-        configJson: v2rayUrl.getFullConfiguration(),
-        serverAddress: _config!.core.serverAddress,
-        serverPort: _config!.core.serverPort,
-        protocol: _config!.core.protocol,
-        logLevel: _config!.core.logLevel,
-        enableLogging: _config!.core.enableLogging,
-      );
-      final updatedConfig = VpnEngineConfig(
-        core: updatedCore,
-        driver: _config!.driver,
-        autoConnect: _config!.autoConnect,
-        connectionTimeout: _config!.connectionTimeout,
-      );
-      await initialize(updatedConfig);
-    }
+    // Определяем тип ядра из URL
+    CoreType coreType = CoreType.singbox; // По умолчанию
+    // TODO: Определить тип ядра из конфигурации сервера
+
+    // Initialize with server configuration
+    await initialize(
+      coreType: coreType,
+      configJson: v2rayUrl.getFullConfiguration(),
+    );
 
     return await connect();
   }
@@ -330,7 +362,7 @@ class VpnClientEngine {
     _statsStreamController = null;
     _logStreamController = null;
     _subscriptionManager.dispose();
-    _platform.dispose();
+    _platformInterface?.dispose();
   }
 
   // Приватные методы
@@ -371,3 +403,11 @@ class VpnClientEngine {
     _logStreamController?.add({'level': level, 'message': message});
   }
 }
+
+// Импорты для типов
+import 'models/core_type.dart';
+import 'models/driver_type.dart';
+
+// Типы из subscription_manager экспортируются через сам файл subscription_manager.dart
+// Subscription, ServerConfig, PingResult определены там
+
