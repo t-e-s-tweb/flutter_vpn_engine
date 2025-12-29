@@ -28,7 +28,9 @@ jobs:
           ${{ runner.os }}-gradle-
 
     - name: Build with Gradle
-      run: ./gradlew assembleDebug
+      run: |
+       cd app
+       ./gradlew assembleDebug
 
     
 
